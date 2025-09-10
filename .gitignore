@@ -1,0 +1,14 @@
+# Ignore API Key and token storage files
+config.py
+
+# Ignore Python bytecode files
+__pycache__/
+*.pyc
+
+# Ignore the Python virtual environment folder
+.venv/
+
+# Ignore any sensitive environment files if we add them later
+.env
+.env.*
+!.env.example

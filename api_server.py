@@ -10,9 +10,10 @@ from bs4 import BeautifulSoup
 from sklearn.cluster import KMeans
 from flask import Flask, request, jsonify
 import logging
+import config
 
 # --- CONFIGURATION ---
-SERPAPI_KEY = "5ec9ba483195d2e93b2ed08be47ef8d9b81604e200bdc0cadd6388481cc3c944" 
+SERPAPI_KEY = config.SERP_API_KEY
 
 # --- MODEL LOADING (Happens only once on startup) ---
 print("Loading Gemma-2B Model... This will take time and RAM.", file=sys.stderr)

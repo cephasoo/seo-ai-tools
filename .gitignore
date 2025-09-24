@@ -8,7 +8,14 @@ __pycache__/
 # Ignore the Python virtual environment folder
 .venv/
 
-# Ignore any sensitive environment files if we add them later
+# Ignore any sensitive environment files
 .env
 .env.*
 !.env.example
+
+# --- CORRECTED CUSTOM MODEL EXCLUSIONS ---
+# Exclude the two large custom model directories.
+# Since they are located in the same directory as .gitignore, 
+# a simple relative path (folder name + trailing slash) is sufficient.
+my-expert-seo-generator-merged/
+my-expert-seo-embedder/

@@ -1,4 +1,4 @@
-# api_server.py (v7.3 - Dual Analysis with Enhanced On-Page Output)
+# api_server.py (v8.2 - Triple-Call Synthesis with Data Filtering & Cost Control)
 
 import sys
 import torch
@@ -12,7 +12,7 @@ from sentence_transformers import SentenceTransformer
 from serpapi import GoogleSearch
 from bs4 import BeautifulSoup
 from sklearn.cluster import KMeans
-from config import SERP_API_KEY, SCRAPER_API_KEY # Ensure config.py is updated
+from config import SERP_API_KEY, SCRAPER_API_KEY 
 import urllib3
 
 # Suppress the InsecureRequestWarning
@@ -41,30 +41,34 @@ def get_embedding(text):
     return embedding.tolist()
 
 def scrape_url(url, data): 
-    """Uses ScraperAPI to reliably fetch and render page content."""
+    """Uses ScraperAPI to reliably fetch and render page content with cost control."""
     try:
-        # FIX: Ensure the API receives a clean URL by stripping internal brackets
+        # 1. Clean URL and get dynamic context
         clean_url = url.replace('[', '').replace(']', '').strip()
         country_code = data.get('target_country', 'us') 
         
+        # 2. Build Premium Payload with Cost Control (50 credits max per scrape attempt)
         payload = {
             'api_key': SCRAPER_API_KEY,
             'url': clean_url,
             'render': 'true', 
-            'country_code': country_code
+            'premium': 'true',          # High-reliability proxy pool
+            'country_code': country_code,
+            'max_cost': '50'            # CRITICAL COST GUARDRAIL: Stops credit bleed
         }
         
+        # 3. Send request with a generous, but not infinite, timeout
         response = requests.get(SCRAPER_API_ENDPOINT, params=payload, timeout=60)
         response.raise_for_status() 
 
-        if not response.text or "you've been blocked" in response.text.lower():
+        # 4. Anti-bot/Error Check (ScraperAPI passes the error page as 200/400 often)
+        if not response.text or "you've been blocked" in response.text.lower() or "checking if the site connection is secure" in response.text.lower():
              print(f"ScraperAPI returned a block page for {url}", file=sys.stderr)
              return None
 
-        # Parse the successfully retrieved HTML content
+        # 5. Parse and clean content
         soup = BeautifulSoup(response.text, 'html.parser')
         
-        # Content cleaning
         for tag in soup(['nav', 'footer', 'header', 'script', 'style', 'aside', 'form']):
             tag.decompose()
         content = ' '.join(soup.stripped_strings)
@@ -91,6 +95,7 @@ JSON Output:
     inputs = gen_tokenizer(prompt_text, return_tensors="pt")
     outputs = gen_model.generate(**inputs, max_new_tokens=200)
     generated_text = gen_tokenizer.decode(outputs[0], skip_special_tokens=True)
+    
     try:
         # Robust JSON extraction and cleaning
         json_str = generated_text[generated_text.find('{'):generated_text.rfind('}')+1]
@@ -98,12 +103,12 @@ JSON Output:
         if not json_str: 
             raise ValueError("No JSON object found in model output.")
         
-        json_str = json_str.strip().replace("'", '"') # Aggressive quote and whitespace clean
+        # Aggressive cleaning for structural validity
+        json_str = json_str.strip().replace("'", '"').replace('\n', '\\n').replace('\t', '\\t') 
         
         return json.loads(json_str)
         
-    except (json.JSONDecodeError, ValueError) as e:
-        print(f"Failed to decode JSON from model output. Raw text: '{generated_text}'. Error: {e}", file=sys.stderr)
+    except json.JSONDecodeError as e:
         return {"intent": "Analysis Error", "concepts": []}
 
 
@@ -125,56 +130,22 @@ JSON Output:
     inputs = gen_tokenizer(prompt_text, return_tensors="pt")
     outputs = gen_model.generate(**inputs, max_new_tokens=500)
     generated_text = gen_tokenizer.decode(outputs[0], skip_special_tokens=True)
+    
     try:
         # 1. Isolate the RAW JSON string block (from the first { to the last })
-        json_str = generated_text[generated_text.find('{'):generated_text.rfind('}')+1]
-        
-        if not json_str: 
-            raise ValueError("No JSON object found in model output.")
-        
-        # 2. **Aggressive Cleaning for malformed strings/quotes**
-        json_str = json_str.strip().replace("'", '"')
-        
-        # 3. **SAFEST PARSING ATTEMPT (using Python's JSON parser):**
-        # Attempt to load the JSON. If this fails, we resort to Regex extraction.
-        try:
-            return json.loads(json_str)
-        except json.JSONDecodeError:
-            pass # Proceed to aggressive regex reconstruction
-            
-        # --- AGGRESSIVE REGEX RECONSTRUCTION ---
-        # This bypasses structural errors (like unmatched brackets) by finding valid fields.
-        
-        # Define the fields we are looking for (based on the expected output schema)
-        fields = ["title", "summary", "key_arguments", "concepts"]
-        reconstructed_data = {}
-        
-        # Regex to find: "key": [value] or "key": "value"
-        for field in fields:
-            # Pattern looks for "field_name" followed by a colon and then captures the value.
-            # Captures strings ("...") or arrays ([...])
-            pattern = rf'"{field}"\s*:\s*(?:"((?:\\.|[^"])*)"|(\[[\s\S]*?\]))'
-            match = re.search(pattern, json_str, re.IGNORECASE)
-            
-            if match:
-                value_str = match.group(1) if match.group(1) is not None else match.group(2)
-                
-                # Try to evaluate the value (handles string vs array types)
-                try:
-                    # Use literal_eval to handle single-quoted list/array contents
-                    reconstructed_data[field] = ast.literal_eval(value_str.strip())
-                except (ValueError, SyntaxError):
-                    # If evaluation fails, treat it as a raw string (e.g., if it's a quote-free string)
-                    reconstructed_data[field] = value_str.strip()
+        json_match = re.search(r'\{[\s\S]*?\}', generated_text) 
+        if not json_match:
+            raise ValueError("No complete JSON object found in model output.")
+        json_str = json_match.group(0)
 
-        # If we successfully extracted any data, return the reconstructed dictionary
-        if reconstructed_data:
-            return reconstructed_data
-        else:
-            raise ValueError("Reconstruction failed: No key fields found.")
+        # 2. Aggressive Parsing using ast.literal_eval (The most resilient method)
+        # Clean newlines/tabs before parsing
+        clean_json_str = json_str.strip().replace('\n', ' ').replace('\t', ' ')
+        data_dict = ast.literal_eval(clean_json_str) 
+
+        return data_dict
         
-    except (ValueError, SyntaxError) as e:
-        # Fallback for catastrophic failure
+    except (SyntaxError, ValueError, IndexError) as e:
         print(f"Failed to decode JSON from model output (FINAL FALLBACK). Error: {e}", file=sys.stderr)
         return {
             "title": "Synthesis Error",
@@ -183,9 +154,10 @@ JSON Output:
             "concepts": ["Error"]
         }
 
+
 # --- API ENDPOINTS ---
 
-# 1. SERP Analysis Endpoint (Topic-Driven Research)
+# 1. SERP Analysis Endpoint (Topic-Driven Research - TRIPLE CALL)
 @app.route('/analyze', methods=['POST'])
 def analyze_route():
     data = request.json
@@ -194,26 +166,78 @@ def analyze_route():
     timestamp = data.get('ts')
 
     if not query: return jsonify({"error": "No topic/query provided"}), 400
-    print(f"Analyzing SERP for query: {query}", file=sys.stderr)
+    print(f"Analyzing SERP for query: {query} using DUAL-CALL strategy.", file=sys.stderr)
     
-    # 1. Get SERP results (via SerpAPI)
-    search = GoogleSearch({"q": query, "api_key": SERP_API_KEY, "num": 15})
-    results = search.get_dict().get("organic_results", [])
+    # --- 1. CALL FOR RICH RESULTS (Standard Engine, Shallow Search) ---
+    rich_search_params = {
+        "engine": "google", 
+        "q": query,
+        "api_key": SERP_API_KEY,
+        "num": 10 
+    }
+    rich_results_data = GoogleSearch(rich_search_params).get_dict()
     
+    # --- CONDITIONAL CALL FOR FULL AI OVERVIEW (3rd CALL) ---
+    rich_features = {}
+    ai_overview_data = rich_results_data.get('ai_overview')
+
+    if ai_overview_data:
+        # Check if the AIO is lazy-loaded and requires a token follow-up
+        if ai_overview_data.get('page_token'):
+            print("AIO token found. Making secondary call to fetch full AIO content.", file=sys.stderr)
+            token = ai_overview_data['page_token']
+            aio_params = {
+                "engine": "google_ai_overview",
+                "page_token": token,
+                "api_key": SERP_API_KEY
+            }
+            aio_response = GoogleSearch(aio_params).get_dict()
+            
+            if aio_response.get('ai_overview'):
+                rich_features['ai_overview'] = aio_response['ai_overview']
+            else:
+                rich_features['ai_overview'] = ai_overview_data
+        else:
+            # Full AIO was in the primary response
+            rich_features['ai_overview'] = ai_overview_data
+
+    # Capture other rich elements 
+    for key in ['knowledge_graph', 'featured_snippet', 'answer_box']:
+        if key in rich_results_data:
+            rich_features[key] = rich_results_data[key]
+
+
+    # --- 2. CALL FOR DEEP ORGANIC RESULTS (Fast & Light Engine) ---
+    deep_search_params = {
+        "engine": "google_light_fast", 
+        "q": query,
+        "api_key": SERP_API_KEY,
+        "num": 44 # Maximum organic depth
+    }
+    deep_results_data = GoogleSearch(deep_search_params).get_dict()
+    organic_results = deep_results_data.get("organic_results", [])
+    
+    # --- 3. SCRAPING AND CLUSTERING (Using 100 organic results) ---
     scraped_data = []
     
-    # 2. Iterate and scrape (Now using ScraperAPI via scrape_url)
-    for result in results:
-        content = scrape_url(result.get("link"), data) 
-        if content:
+    for result in organic_results:
+        link = result.get("link")
+        # STRATEGIC DATA FILTERING (Pillar A Decommission Replacement)
+        content = scrape_url(link, data) 
+        
+        # Check if content is garbage (error page, too short, or explicitly blocked)
+        if content and len(content) > 500 and "access denied" not in content.lower():
             scraped_data.append({
                 "title": result.get("title"), "source": result.get("displayed_link", result.get("source")),
                 "content": content, "embedding": get_embedding(content)
             })
+        else:
+            print(f"Filtered out low-quality/error content from {link}", file=sys.stderr)
+
+
+    if len(scraped_data) < 3: return jsonify({"error": "Not enough **clean** data to perform SERP analysis", "results_found": len(scraped_data)}), 400
     
-    if len(scraped_data) < 3: return jsonify({"error": "Not enough data to perform SERP analysis", "results_found": len(scraped_data)}), 400
-    
-    # 3. Clustering and Synthesis (Uses cluster synthesis helper)
+    # K-Means Clustering Logic
     embeddings = [item['embedding'] for item in scraped_data]
     num_clusters = min(3, len(scraped_data))
     kmeans = KMeans(n_clusters=num_clusters, random_state=0, n_init='auto').fit(embeddings)
@@ -226,7 +250,6 @@ def analyze_route():
     for i, group_data in cluster_groups.items():
         if not group_data: continue
         combined_content = " ".join([d['content'] for d in group_data])[:8000]
-        print(f"Synthesizing Cluster {chr(65 + i)}...", file=sys.stderr)
         synthesis = generate_cluster_synthesis(combined_content, query)
         enriched_clusters.append({
             "name": f"Cluster {chr(65 + i)}: {synthesis.get('intent', 'N/A')}",
@@ -235,13 +258,14 @@ def analyze_route():
             "concepts": synthesis.get('concepts', [])
         })
 
-    # 4. Final Output - Returns 'clusters' for SERP data
+    # 4. Final Output - Returns clusters AND rich features
     final_output = {
         "channel": channel,
         "ts": timestamp,
         "payload": {
             "query": query,
-            "clusters": enriched_clusters # SERP analysis returns clusters
+            "clusters": enriched_clusters, 
+            "rich_features": rich_features # PASSES AI OVERVIEW AND SNIPPETS
         }
     }
 
@@ -252,7 +276,7 @@ def analyze_route():
 @app.route('/analyze_url', methods=['POST'])
 def analyze_url_route():
     data = request.json
-    url = data.get('url') # N8N passes one URL here per iteration
+    url = data.get('url') 
     query = data.get('topic')
     channel = data.get('channel')
     timestamp = data.get('ts')
@@ -261,11 +285,9 @@ def analyze_url_route():
     
     print(f"Analyzing single URL: {url}", file=sys.stderr)
     
-    # 1. Scrape only the requested URL
     content = scrape_url(url, data) 
     
     if not content: 
-        # API returns a 400 when scraping fails, as defined by the requirement
         return jsonify({"error": "Failed to retrieve content from URL"}), 400
     
     # 2. Generate detailed summary (Uses enhanced summary helper)
@@ -276,7 +298,7 @@ def analyze_url_route():
         "channel": channel,
         "ts": timestamp,
         "url": url, 
-        "payload": summary_data # URL analysis returns rich metadata
+        "payload": summary_data
     }
     
     return jsonify(final_output)
@@ -288,7 +310,6 @@ def generate_route():
     data = request.json
     instruction = data.get('instruction')
     user_input = data.get('input', '')
-
     channel = data.get('channel')
     timestamp = data.get('ts')
 
@@ -300,7 +321,6 @@ def generate_route():
     print("Generating specialized response...", file=sys.stderr)
     outputs = gen_model.generate(**inputs, max_new_tokens=500)
     result_full = gen_tokenizer.decode(outputs[0], skip_special_tokens=True)
-    
     result_only_output = result_full.split("### Output:")[1].strip()
 
     final_output = {

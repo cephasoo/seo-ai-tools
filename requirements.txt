@@ -1,0 +1,13 @@
+Flask
+gunicorn
+torch
+transformers
+sentence-transformers
+serpapi
+beautifulsoup4
+scikit-learn
+python-dotenv
+faiss-cpu
+requests
+urllib3
+numpy

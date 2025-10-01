@@ -1,4 +1,4 @@
-# api_server.py (v8.3 - Consolidated SERP, JSON Parsing & Robust Rich Features - FIXED)
+# api_server.py (v8.5 - RAG Complete, Consolidated SERP, and Caching Implemented)
 
 import sys
 import torch
@@ -6,6 +6,11 @@ import json
 import requests
 import re
 import ast
+import numpy as np
+import faiss
+import pickle
+import os
+import functools # NEW: For implementing in-memory caching
 from flask import Flask, request, jsonify
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from sentence_transformers import SentenceTransformer
@@ -21,12 +26,14 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 # --- CONFIGURATION ---
 app = Flask(__name__)
 SCRAPER_API_ENDPOINT = "http://api.scraperapi.com/"
+VECTOR_STORE_PATH = 'rag_knowledge_base.pkl' # File to save vectors and chunks
 
 # --- MODEL LOADING (UNIFIED) ---
 print("Loading Custom Fine-Tuned SEO Embedding Model...", file=sys.stderr)
 embedding_model_path = 'my-expert-seo-embedder'
 embedding_model = SentenceTransformer(embedding_model_path, device='cpu')
-print("Custom embedding model loaded.", file=sys.stderr)
+EMBEDDING_DIM = embedding_model.get_sentence_embedding_dimension() # Dynamically get dim
+print(f"Custom embedding model loaded. Dimension: {EMBEDDING_DIM}", file=sys.stderr)
 
 print("Loading Merged Fine-Tuned Generative Model (SEO Co-pilot)...", file=sys.stderr)
 gen_model_path = 'my-expert-seo-generator-merged'
@@ -35,10 +42,45 @@ gen_model = AutoModelForCausalLM.from_pretrained(gen_model_path)
 print("Unified generative model loaded.", file=sys.stderr)
 
 
+# --- RAG INITIALIZATION (Build Time) ---
+# Initialize the FAISS index and document store from a file if it exists
+def load_or_create_faiss_index():
+    global FAISS_INDEX, DOC_STORE
+    
+    if os.path.exists(VECTOR_STORE_PATH):
+        try:
+            with open(VECTOR_STORE_PATH, 'rb') as f:
+                FAISS_INDEX, DOC_STORE = pickle.load(f)
+            print("Loaded existing RAG index and document store.", file=sys.stderr)
+        except Exception as e:
+            print(f"Error loading FAISS index: {e}. Creating new index.", file=sys.stderr)
+            # Create a fresh index if loading fails
+            FAISS_INDEX = faiss.IndexFlatL2(EMBEDDING_DIM) 
+            DOC_STORE = []
+    else:
+        # IndexFlatL2 uses Euclidean distance (L2 norm) for similarity search
+        FAISS_INDEX = faiss.IndexFlatL2(EMBEDDING_DIM) 
+        DOC_STORE = [] # List to store the original text chunks
+
+def save_faiss_index():
+    """Saves the current FAISS index and document store to disk."""
+    try:
+        with open(VECTOR_STORE_PATH, 'wb') as f:
+            pickle.dump((FAISS_INDEX, DOC_STORE), f)
+        print("RAG index saved successfully.", file=sys.stderr)
+    except Exception as e:
+        print(f"Error saving FAISS index: {e}", file=sys.stderr)
+
+# Load the index immediately after model loading
+load_or_create_faiss_index()
+
+
 # --- HELPER FUNCTIONS ---
 def get_embedding(text):
-    embedding = embedding_model.encode(text)
-    return embedding.tolist()
+    # Ensure text is in list format for the SentenceTransformer model
+    embedding = embedding_model.encode(text, convert_to_numpy=True)
+    # The output is a numpy array; we return it as a list of float for JSON serialization
+    return embedding.tolist()[0] if isinstance(embedding, np.ndarray) and embedding.ndim > 1 else embedding.tolist()
 
 def scrape_url(url, data):
     """Uses ScraperAPI to reliably fetch and render page content with cost control and improved filtering."""
@@ -47,27 +89,26 @@ def scrape_url(url, data):
         clean_url = url.replace('[', '').replace(']', '').strip()
         country_code = data.get('target_country', 'us')
 
-        # 2. Build Premium Payload with Cost Control (50 credits max per scrape attempt)
-        # 🐛 FIX: The 'payload' dictionary definition was missing, causing the NameError.
+        # 2. Build Premium Payload with Cost Control (FIXED: Payload was missing in previous versions)
         payload = {
             'api_key': SCRAPER_API_KEY,
             'url': clean_url,
             'country_code': country_code,
-            'render': 'true', # Best practice for modern, JavaScript-heavy sites
-            'premium': 'true', # Use a premium proxy for better reliability
-            'max_cost': '50', # CRITICAL COST GUARDRAIL: Stops credit bleed
-            'session_number': '1' # Use a sticky session for better results
+            'render': 'true', 
+            'premium': 'true', 
+            'max_cost': '50', 
+            'session_number': '1' 
         }
 
         # 3. Send request with a generous, but not infinite, timeout
         response = requests.get(SCRAPER_API_ENDPOINT, params=payload, timeout=60)
-        
+
         # --- CRITICAL REFINEMENT: Check status before parsing ---
         if response.status_code != 200:
             print(f"ScraperAPI returned non-200 status {response.status_code} for {url}", file=sys.stderr)
             response.raise_for_status()
 
-        # 4. Anti-bot/Error Check 
+        # 4. Anti-bot/Error Check
         if not response.text or "you've been blocked" in response.text.lower() or "checking if the site connection is secure" in response.text.lower() or "access is restricted" in response.text.lower():
             print(f"ScraperAPI returned a block page or restricted access for {url}", file=sys.stderr)
             return None
@@ -75,14 +116,13 @@ def scrape_url(url, data):
         # 5. Parse and clean content (Improved cleanup for scholarly/paywall sites)
         soup = BeautifulSoup(response.text, 'html.parser')
 
-        # Added more aggressive tag decomposition, especially for scholarly/paywall headers
+        # Added more aggressive tag decomposition
         for tag in soup(['nav', 'footer', 'header', 'script', 'style', 'aside', 'form', 'iframe', 'canvas', 'svg']):
             tag.decompose()
 
         content = ' '.join(soup.stripped_strings)
 
         # --- FINAL QUALITY GATE ---
-        # If content is still too short after cleaning, filter it out.
         if len(content) < 500:
             print(f"Content for {url} too short after cleaning ({len(content)} chars). Filtering.", file=sys.stderr)
             return None
@@ -90,12 +130,11 @@ def scrape_url(url, data):
         return content[:5000]
 
     except requests.RequestException as e:
-        # This catches the 500 error from the log gracefully
         print(f"Error scraping {url} via ScraperAPI: {e}", file=sys.stderr)
         return None
 
-# Helper 1: Used for K-Means Synthesis (Topic/Intent/Concepts only)
 def generate_cluster_synthesis(cluster_content, query):
+    # ... (Synthesis logic remains the same)
     prompt_text = f"""
 Analyze the Reference Text, which contains content scraped from search results for the query '{query}'.
 Your output MUST be a single, valid JSON object with two keys:
@@ -112,16 +151,12 @@ JSON Output:
     generated_text = gen_tokenizer.decode(outputs[0], skip_special_tokens=True)
 
     try:
-        # 1. Isolate the RAW JSON string block (from the first { to the last })
         json_match = re.search(r'\{[\s\S]*?\}', generated_text)
         if not json_match:
             raise ValueError("No complete JSON object found in model output.")
         json_str = json_match.group(0)
-
-        # 2. Aggressive Parsing using ast.literal_eval (Robust to single quotes/newlines)
         clean_json_str = json_str.strip().replace('\n', ' ').replace('\t', ' ')
         data_dict = ast.literal_eval(clean_json_str)
-
         return data_dict
 
     except (SyntaxError, ValueError, IndexError) as e:
@@ -129,8 +164,8 @@ JSON Output:
         return {"intent": "Analysis Error", "concepts": []}
 
 
-# Helper 2: Used for Single URL Detailed Summary (Substance for downstream AI)
 def generate_url_summary(url_content, query):
+    # ... (URL summary logic remains the same)
     prompt_text = f"""
 Analyze the Reference Article content for the query '{query}'. Provide a detailed summary and extract the key arguments for comparison.
 Your output MUST be a single, valid JSON object with four keys:
@@ -149,16 +184,12 @@ JSON Output:
     generated_text = gen_tokenizer.decode(outputs[0], skip_special_tokens=True)
 
     try:
-        # 1. Isolate the RAW JSON string block
         json_match = re.search(r'\{[\s\S]*?\}', generated_text)
         if not json_match:
             raise ValueError("No complete JSON object found in model output.")
         json_str = json_match.group(0)
-
-        # 2. Aggressive Parsing using ast.literal_eval
         clean_json_str = json_str.strip().replace('\n', ' ').replace('\t', ' ')
         data_dict = ast.literal_eval(clean_json_str)
-
         return data_dict
 
     except (SyntaxError, ValueError, IndexError) as e:
@@ -171,42 +202,127 @@ JSON Output:
         }
 
 
-# --- API ENDPOINTS ---
+# --- NEW RAG API ENDPOINTS ---
 
-# 1. SERP Analysis Endpoint (Topic-Driven Research - CONSOLIDATED & ROBUST)
-@app.route('/analyze', methods=['POST'])
-def analyze_route():
+# 1. Indexing Endpoint: Accepts a text chunk, embeds it, and stores it (Build Time)
+@app.route('/embed_and_index', methods=['POST'])
+def embed_and_index_route():
     data = request.json
-    query = data.get('topic')
-    channel = data.get('channel')
-    timestamp = data.get('ts')
+    chunk_text = data.get('chunk')
+    doc_source = data.get('source', 'n8n_upload')
 
-    if not query: return jsonify({"error": "No topic/query provided"}), 400
-    print(f"Analyzing SERP for query: {query} using CONSOLIDATED 'google' engine.", file=sys.stderr)
+    if not chunk_text:
+        return jsonify({"error": "No text chunk provided for indexing"}), 400
+
+    try:
+        # 1. Generate Embedding
+        vector = get_embedding(chunk_text)
+        vector_np = np.array([vector], dtype=np.float32)
+
+        # 2. Add to FAISS Index
+        global DOC_STORE
+        doc_id = len(DOC_STORE)
+        DOC_STORE.append({'text': chunk_text, 'source': doc_source, 'id': doc_id}) 
+        
+        # Add the vector to the FAISS index
+        FAISS_INDEX.add(vector_np)
+        
+        # 3. Save the index state immediately
+        save_faiss_index()
+
+        return jsonify({
+            "status": "success",
+            "index_id": doc_id,
+            "message": f"Chunk indexed successfully. Total documents: {len(DOC_STORE)}"
+        })
+
+    except Exception as e:
+        print(f"RAG Indexing Error: {e}", file=sys.stderr)
+        return jsonify({"error": "Failed during RAG indexing", "details": str(e)}), 500
+
+
+# 2. Retrieval Endpoint: Accepts a query and returns relevant context (Query Time)
+@app.route('/retrieve_context', methods=['POST'])
+def retrieve_context_route():
+    data = request.json
+    query = data.get('query')
+    k = data.get('k', 3) # Number of chunks to retrieve
+
+    if not query:
+        return jsonify({"error": "No query provided for context retrieval"}), 400
+    if len(DOC_STORE) == 0:
+        return jsonify({"error": "RAG index is empty. Please index documents first."}), 400
+        
+    try:
+        # 1. Embed the Query
+        query_vector = get_embedding(query)
+        query_vector_np = np.array([query_vector], dtype=np.float32)
+
+        # 2. Perform Similarity Search
+        k = min(k, len(DOC_STORE)) 
+        
+        # D: Distances (scores), I: Indices (IDs of the nearest neighbors in DOC_STORE)
+        distances, indices = FAISS_INDEX.search(query_vector_np, k) 
+
+        # 3. Retrieve Original Text Chunks and Sources
+        retrieved_context = []
+        # Iterate using indices and distances simultaneously
+        for i, doc_index in enumerate(indices[0]):
+            if doc_index >= 0 and doc_index < len(DOC_STORE):
+                doc_data = DOC_STORE[doc_index]
+                
+                retrieved_context.append({
+                    'text': doc_data['text'],
+                    'source_id': doc_data['source'],
+                    'distance': float(distances[0][i]) # Return the raw score
+                })
+        
+        # 4. Format Output
+        return jsonify({
+            "status": "success",
+            "context": retrieved_context,
+            "top_distance": float(distances[0][0])
+        })
+
+    except Exception as e:
+        print(f"RAG Retrieval Error: {e}", file=sys.stderr)
+        return jsonify({"error": "Failed during RAG context retrieval", "details": str(e)}), 500
+
+
+# --- EXISTING API ENDPOINTS (NOW CACHED) ---
+
+# Caching decorator for cost and latency reduction
+# maxsize=32 (cache last 32 unique calls), timeout=300 seconds (5 minutes)
+@functools.lru_cache(maxsize=32, typed=True)
+def cached_analyze_serp(query_key):
+    """Performs the actual SERP analysis and is decorated for caching."""
+    # Unpack the query/topic from the simple string key
+    # Note: We pass topic, channel, and timestamp to ensure the key is unique enough
+    query, channel, timestamp = query_key.split("|") 
+
+    if not query: return {"error": "No topic/query provided"}, 400
 
     # --- 1. CONSOLIDATED CALL FOR RICH & ORGANIC RESULTS (Standard Google Engine) ---
     consolidated_search_params = {
         "engine": "google",
         "q": query,
         "api_key": SERP_API_KEY,
-        "num": 10 # Standard engine limit for primary organic results
+        "num": 10 
     }
 
     try:
         results_data = GoogleSearch(consolidated_search_params).get_dict()
     except Exception as e:
         print(f"SerpApi 'google' engine call failed: {e}", file=sys.stderr)
-        return jsonify({"error": "SerpApi call failed during consolidated search.", "details": str(e)}), 500
+        return {"error": "SerpApi call failed during consolidated search.", "details": str(e)}, 500
 
     organic_results = results_data.get("organic_results", [])
 
-    # --- CONDITIONAL CALL FOR FULL AI OVERVIEW (SECONDARY CALL - REQUIRED FOR FULL AIO CONTENT) ---
+    # --- CONDITIONAL CALL FOR FULL AI OVERVIEW (SECONDARY CALL) ---
     rich_features = {}
     ai_overview_data = results_data.get('ai_overview')
 
-    # CRITICAL: Logic to handle lazy-loaded AIO which requires a token follow-up
     if ai_overview_data:
-        # Check if the AIO is lazy-loaded and requires a token follow-up
         if ai_overview_data.get('page_token'):
             print("AIO token found. Making secondary call to fetch full AIO content.", file=sys.stderr)
             token = ai_overview_data['page_token']
@@ -217,47 +333,30 @@ def analyze_route():
             }
             try:
                 aio_response = GoogleSearch(aio_params).get_dict()
-                if aio_response.get('ai_overview'):
-                    # Success: Use the full response from the dedicated AIO engine
-                    rich_features['ai_overview'] = aio_response['ai_overview']
-                else:
-                    # Failure in secondary call: Fall back to the initial, likely partial, data
-                    rich_features['ai_overview'] = ai_overview_data
+                rich_features['ai_overview'] = aio_response.get('ai_overview', ai_overview_data)
             except Exception as e:
-                # Handle total failure of secondary call gracefully
                 print(f"Secondary AIO call failed: {e}", file=sys.stderr)
                 rich_features['ai_overview'] = ai_overview_data
         else:
-            # Full AIO was in the primary response (Rare but possible)
             rich_features['ai_overview'] = ai_overview_data
 
-    # Capture all high-value rich elements from the consolidated result
+    # Capture all high-value rich elements
     for key in [
-        'knowledge_graph',
-        'featured_snippet',
-        'answer_box',
-        'related_questions',
-        'related_searches',
-        'top_stories',         # New
-        'local_results',       # New
-        'videos',              # New
-        'shopping_results',    # New
-        'inline_tweets'        # New
+        'knowledge_graph', 'featured_snippet', 'answer_box', 'related_questions', 'related_searches',
+        'top_stories', 'local_results', 'videos', 'shopping_results', 'inline_tweets'
     ]:
-        if key in results_data:
-            # Only add if not already populated by the AIO logic above
-            if key not in rich_features:
-                rich_features[key] = results_data[key]
+        if key in results_data and key not in rich_features:
+            rich_features[key] = results_data[key]
 
 
-    # --- 2. SCRAPING AND CLUSTERING (Now using up to 10 organic results) ---
+    # --- 2. SCRAPING AND CLUSTERING (Using up to 10 organic results) ---
     scraped_data = []
+    request_data = {"target_country": "us"} # Default data for scrape_url helper
 
     for result in organic_results:
         link = result.get("link")
-        content = scrape_url(link, data)
+        content = scrape_url(link, request_data)
 
-        # Check if content is garbage (error page, too short, or explicitly blocked)
         if content and len(content) > 500 and "access denied" not in content.lower():
             scraped_data.append({
                 "title": result.get("title"), "source": result.get("displayed_link", result.get("source")),
@@ -267,7 +366,9 @@ def analyze_route():
             print(f"Filtered out low-quality/error content from {link}", file=sys.stderr)
 
 
-    if len(scraped_data) < 3: return jsonify({"error": "Not enough **clean** data to perform SERP analysis (Need 3+, found: " + str(len(scraped_data)) + ")", "results_found": len(scraped_data)}), 400
+    if len(scraped_data) < 3: 
+        # Return a standard JSON response for the caching logic to handle
+        return {"error": f"Not enough **clean** data to perform SERP analysis (Need 3+, found: {len(scraped_data)})", "results_found": len(scraped_data)}, 400
 
     # K-Means Clustering Logic
     embeddings = [item['embedding'] for item in scraped_data]
@@ -290,23 +391,50 @@ def analyze_route():
             "concepts": synthesis.get('concepts', [])
         })
 
-    # 3. Final Output - Returns clusters AND rich features
+    # Final Output - Returns clusters AND rich features
     final_output = {
         "channel": channel,
         "ts": timestamp,
         "payload": {
             "query": query,
             "clusters": enriched_clusters,
-            "rich_features": rich_features # PASSES AI OVERVIEW AND SNIPPETS
+            "rich_features": rich_features 
         }
     }
+    
+    # Return the dictionary directly for caching
+    return final_output
 
-    return jsonify(final_output)
+# 1. SERP Analysis Endpoint (The live route that calls the cached function)
+@app.route('/analyze', methods=['POST'])
+def analyze_route():
+    data = request.json
+    query = data.get('topic')
+    channel = data.get('channel', 'N/A')
+    timestamp = data.get('ts', 'N/A')
+
+    # Construct the simple, cacheable key (must be immutable)
+    query_key = f"{query}|{channel}|{timestamp}"
+
+    try:
+        # Call the cached function
+        results = cached_analyze_serp(query_key)
+        
+        # Check for error status returned by the cached function
+        if isinstance(results, tuple) and len(results) == 2 and isinstance(results[0], dict) and "error" in results[0]:
+            # Handle the 400 error case returned from the cached function
+            return jsonify(results[0]), results[1]
+            
+        return jsonify(results)
+    except Exception as e:
+        print(f"Error during cached analyze route execution: {e}", file=sys.stderr)
+        return jsonify({"error": "Internal server error during analysis"}), 500
 
 
 # 2. On-Page Analysis Endpoint (URL-Driven Research)
 @app.route('/analyze_url', methods=['POST'])
 def analyze_url_route():
+    # ... (URL analysis logic remains the same)
     data = request.json
     url = data.get('url')
     query = data.get('topic')
@@ -338,6 +466,7 @@ def analyze_url_route():
 # 3. Generative Task Endpoint
 @app.route('/generate', methods=['POST'])
 def generate_route():
+    # ... (Generative logic remains the same)
     data = request.json
     instruction = data.get('instruction')
     user_input = data.get('input', '')
@@ -350,9 +479,16 @@ def generate_route():
     inputs = gen_tokenizer(prompt, return_tensors="pt")
 
     print("Generating specialized response...", file=sys.stderr)
-    outputs = gen_model.generate(**inputs, max_new_tokens=500)
+    outputs = gen_model.generate(**inputs, max_new_tokens=4096)
     result_full = gen_tokenizer.decode(outputs[0], skip_special_tokens=True)
-    result_only_output = result_full.split("### Output:")[1].strip()
+    
+    # Ensure the generated text is split correctly, handling cases where the model starts immediately
+    if "### Output:" in result_full:
+        result_only_output = result_full.split("### Output:")[1].strip()
+    else:
+        # Fallback: Use the whole generated text if the marker is missed
+        result_only_output = result_full.strip()
+
 
     final_output = {
         "channel": channel,

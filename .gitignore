@@ -19,3 +19,4 @@ __pycache__/
 # a simple relative path (folder name + trailing slash) is sufficient.
 my-expert-seo-generator-merged/
 my-expert-seo-embedder/
+rag_knowledge_base.pkl
